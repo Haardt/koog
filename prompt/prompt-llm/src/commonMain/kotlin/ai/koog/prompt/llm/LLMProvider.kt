@@ -96,4 +96,10 @@ public abstract class LLMProvider(public val id: String, public val display: Str
      */
     @Serializable
     public data object Ollama : LLMProvider("ollama", "Ollama")
+
+    /**
+     * Represents the LM Studio provider within the available set of large language model providers.
+     */
+    @Serializable
+    public data object LMStudio : LLMProvider("lmstudio", "LM Studio")
 }

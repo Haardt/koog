@@ -3,6 +3,8 @@ package ai.koog.prompt.executor.llms.all
 import ai.koog.prompt.executor.clients.anthropic.AnthropicLLMClient
 import ai.koog.prompt.executor.clients.google.GoogleLLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioClientSettings
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioLLMClient
 import ai.koog.prompt.executor.clients.openrouter.OpenRouterLLMClient
 import ai.koog.prompt.executor.llms.SingleLLMPromptExecutor
 import ai.koog.prompt.executor.ollama.client.OllamaClient
@@ -45,3 +47,13 @@ public fun simpleGoogleAIExecutor(apiKey: String): SingleLLMPromptExecutor = Sin
  * @param baseUrl url used to access Ollama server.
  */
 public fun simpleOllamaAIExecutor(baseUrl: String = "http://localhost:11434"): SingleLLMPromptExecutor = SingleLLMPromptExecutor(OllamaClient(baseUrl))
+
+/**
+ * Creates an instance of `SingleLLMPromptExecutor` with an `LMStudioLLMClient`.
+ *
+ * @param baseUrl URL of the LM Studio REST server.
+ */
+public fun simpleLMStudioExecutor(baseUrl: String = "http://localhost:1234"): SingleLLMPromptExecutor =
+    SingleLLMPromptExecutor(
+        LMStudioLLMClient(settings = LMStudioClientSettings(baseUrl = baseUrl))
+    )
