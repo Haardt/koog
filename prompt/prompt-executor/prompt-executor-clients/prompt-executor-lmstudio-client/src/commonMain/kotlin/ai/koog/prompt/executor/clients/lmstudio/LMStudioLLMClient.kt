@@ -32,6 +32,19 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.client.statement.readRawBytes
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioAPIException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioAuthenticationException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioClientErrorException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioErrorDetails
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioMalformedResponseException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioNotFoundException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioRateLimitException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioServerException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioStreamException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioConnectionException
+import ai.koog.prompt.executor.clients.lmstudio.LMStudioStreamEvent // Added import
+import io.ktor.client.plugins.ResponseException
+import kotlinx.serialization.SerializationException
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -41,6 +54,8 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
 import kotlinx.serialization.json.ClassDiscriminatorMode
@@ -135,17 +150,45 @@ public open class LMStudioLLMClient(
             }
 
             if (response.status.isSuccess()) {
-                val openAIResponse = response.body<LMStudioResponse>()
-                processLMStudioResponse(openAIResponse)
+                try {
+                    val openAIResponse = response.body<LMStudioResponse>()
+                    processLMStudioResponse(openAIResponse)
+                } catch (e: SerializationException) {
+                    throw LMStudioMalformedResponseException("Failed to parse successful response: ${e.message}", e)
+                }
             } else {
                 val errorBody = response.bodyAsText()
-                logger.error { "Error from LMStudio API: ${response.status}: $errorBody" }
-                error("Error from LMStudio API: ${response.status}: $errorBody")
+                val httpStatusCode = response.status.value
+                var errorDetails: LMStudioErrorDetails? = null
+                try {
+                    if (errorBody.isNotBlank()) {
+                        errorDetails = json.decodeFromString<LMStudioErrorDetails>(errorBody)
+                    }
+                } catch (e: SerializationException) {
+                    logger.warn { "Failed to parse LMStudio JSON error response: $errorBody" }
+                }
+
+                val errorMessage = errorDetails?.getDetailedMessage() ?: errorBody
+                val logMessage = "Error from LMStudio API: $httpStatusCode - $errorMessage. Details: $errorDetails"
+                logger.error { logMessage }
+
+                when (httpStatusCode) {
+                    401, 403 -> throw LMStudioAuthenticationException(errorJson = errorBody, message = errorMessage)
+                    404 -> throw LMStudioNotFoundException(errorJson = errorBody, message = errorMessage)
+                    429 -> {
+                        // Placeholder for Retry-After header extraction if needed
+                        val retryAfter = response.headers[HttpHeaders.RetryAfter]?.toIntOrNull()
+                        throw LMStudioRateLimitException(errorJson = errorBody, message = errorMessage, retryAfterSeconds = retryAfter)
+                    }
+                    in 400..499 -> throw LMStudioClientErrorException(httpStatusCode, errorJson = errorBody, message = errorMessage)
+                    in 500..599 -> throw LMStudioServerException(httpStatusCode, errorJson = errorBody, message = errorMessage)
+                    else -> throw LMStudioAPIException(httpStatusCode, errorJson = errorBody, message = "Unhandled API error: $errorMessage")
+                }
             }
         }
     }
 
-    override fun executeStreaming(prompt: Prompt, model: LLModel): Flow<String> = flow {
+    override fun executeStreaming(prompt: Prompt, model: LLModel): Flow<LMStudioStreamEvent> = flow {
         logger.debug { "Executing streaming prompt: $prompt with model: $model" }
         require(model.capabilities.contains(LLMCapability.Completion)) {
             "Model ${model.id} does not support chat completions"
@@ -153,35 +196,132 @@ public open class LMStudioLLMClient(
 
         val request = createLMStudioRequest(prompt, emptyList(), model, true)
 
-        try {
-            httpClient.sse(
-                urlString = settings.chatCompletionsPath,
-                request = {
-                    method = HttpMethod.Post
-                    accept(ContentType.Text.EventStream)
-                    headers {
-                        append(HttpHeaders.CacheControl, "no-cache")
-                        append(HttpHeaders.Connection, "keep-alive")
+        httpClient.sse(
+            urlString = settings.chatCompletionsPath,
+            request = {
+                method = HttpMethod.Post
+                accept(ContentType.Text.EventStream)
+                headers {
+                    append(HttpHeaders.CacheControl, "no-cache")
+                    append(HttpHeaders.Connection, "keep-alive")
+                }
+                setBody(request)
+            }
+        ) { // SSEClientSession
+            incoming.collect { event ->
+                event.data?.trim()?.takeIf { it.isNotEmpty() }?.let { dataString ->
+                    if (dataString == "[DONE]") {
+                        // Stream is done, collector will complete.
+                        return@let
                     }
-                    setBody(request)
-                }
-            ) {
-                incoming.collect { event ->
-                    event
-                        .takeIf { it.data != "[DONE]" }
-                        ?.data?.trim()?.let { json.decodeFromString<LMStudioStreamResponse>(it) }
-                        ?.choices?.forEach { choice -> choice.delta.content?.let { emit(it) } }
+                    try {
+                        val streamResponse = json.decodeFromString<LMStudioStreamResponse>(dataString)
+                        streamResponse.choices.forEach { choice ->
+                            // Emit text content if present
+                            choice.delta.content?.let { contentChunk ->
+                                if (contentChunk.isNotEmpty()) { // Avoid emitting empty strings if not desired
+                                     emit(LMStudioStreamEvent.TextChunk(contentChunk))
+                                }
+                            }
+                            // Emit tool call chunks if present
+                            choice.delta.toolCalls?.forEachIndexed { index, toolCall -> // toolCall is LMStudioToolCall
+                                emit(LMStudioStreamEvent.ToolCallChunk(
+                                    toolCallId = toolCall.id,
+                                    functionName = toolCall.function.name,
+                                    argumentsChunk = toolCall.function.arguments,
+                                    toolCallIndex = index
+                                ))
+                            }
+                            // Emit finish reason if present in this delta
+                            choice.finishReason?.let { reason ->
+                                emit(LMStudioStreamEvent.FinishReason(reason))
+                            }
+                        }
+                    } catch (e: SerializationException) {
+                        logger.warn(e) { "Error parsing LMStudio stream event data: $dataString" }
+                        // This exception will be caught by the .catch operator on the flow
+                        throw LMStudioMalformedResponseException("Error parsing stream event: ${e.message}", e)
+                    }
                 }
             }
-        } catch (e: SSEClientException) {
-            e.response?.let { response ->
-                val body = response.readRawBytes().decodeToString()
-                logger.error(e) { "Error from LMStudio API: ${response.status}: ${e.message}.\nBody:\n$body" }
-                error("Error from LMStudio API: ${response.status}: ${e.message}")
+        }
+    }.catch { cause ->
+        when (cause) {
+            is LMStudioMalformedResponseException -> throw cause // Re-throw if already specific
+            is SerializationException -> { // Catch parsing errors not caught inside collect (less likely here)
+                logger.error(cause) { "Serialization error during streaming setup or event processing: ${cause.message}" }
+                throw LMStudioMalformedResponseException("Serialization error in stream: ${cause.message}", cause)
             }
-        } catch (e: Exception) {
-            logger.error { "Exception during streaming: $e" }
-            error(e.message ?: "Unknown error during streaming")
+            is SSEClientException -> {
+                val response = cause.response
+                val httpStatusCode = response?.status?.value
+                var errorBody: String? = null
+                var errorDetails: LMStudioErrorDetails? = null
+                var errorMessage = cause.message ?: "SSE connection error"
+
+                if (response != null) {
+                    try {
+                        errorBody = response.bodyAsText() // Ktor 2.x, Ktor 1.x might need readRawBytes
+                        if (errorBody.isNotBlank()) {
+                           errorDetails = json.decodeFromString<LMStudioErrorDetails>(errorBody)
+                           errorMessage = errorDetails.getDetailedMessage() ?: errorMessage
+                        }
+                    } catch (se: SerializationException) {
+                        logger.warn(se) { "Failed to parse LMStudio JSON error from SSE response: $errorBody" }
+                    } catch (ioe: Exception) {
+                        logger.warn(ioe) { "Failed to read or parse error body from SSE response: ${ioe.message}" }
+                    }
+                }
+                val logMessage = "SSE Error from LMStudio API: $httpStatusCode - $errorMessage. Details: $errorDetails"
+                logger.error(cause) { logMessage }
+
+                if (httpStatusCode != null) {
+                    when (httpStatusCode) {
+                        401, 403 -> throw LMStudioAuthenticationException(errorJson = errorBody, message = errorMessage, cause = cause)
+                        404 -> throw LMStudioNotFoundException(errorJson = errorBody, message = errorMessage, cause = cause)
+                        429 -> {
+                            val retryAfter = response?.headers?.get(HttpHeaders.RetryAfter)?.toIntOrNull()
+                            throw LMStudioRateLimitException(errorJson = errorBody, message = errorMessage, retryAfterSeconds = retryAfter, cause = cause)
+                        }
+                        in 400..499 -> throw LMStudioClientErrorException(httpStatusCode, errorJson = errorBody, message = errorMessage, cause = cause)
+                        in 500..599 -> throw LMStudioServerException(httpStatusCode, errorJson = errorBody, message = errorMessage, cause = cause)
+                        else -> throw LMStudioStreamException("SSE error with code $httpStatusCode: $errorMessage", cause = cause)
+                    }
+                } else {
+                    throw LMStudioStreamException("SSE error: $errorMessage", cause = cause)
+                }
+            }
+            is ResponseException -> { // Catches Ktor client errors for initial HTTP request (non-2xx)
+                val httpStatusCode = cause.response.status.value
+                val errorBody = cause.response.bodyAsText()
+                var errorDetails: LMStudioErrorDetails? = null
+                try {
+                    if (errorBody.isNotBlank()) {
+                        errorDetails = json.decodeFromString<LMStudioErrorDetails>(errorBody)
+                    }
+                } catch (e: SerializationException) {
+                    logger.warn { "Failed to parse LMStudio JSON error response from ResponseException: $errorBody" }
+                }
+                val errorMessage = errorDetails?.getDetailedMessage() ?: errorBody
+                val logMessage = "Error from LMStudio API (initial stream request): $httpStatusCode - $errorMessage. Details: $errorDetails"
+                logger.error(cause) { logMessage }
+
+                when (httpStatusCode) {
+                    401, 403 -> throw LMStudioAuthenticationException(errorJson = errorBody, message = errorMessage, cause = cause)
+                    404 -> throw LMStudioNotFoundException(errorJson = errorBody, message = errorMessage, cause = cause)
+                    429 -> {
+                         val retryAfter = cause.response.headers[HttpHeaders.RetryAfter]?.toIntOrNull()
+                         throw LMStudioRateLimitException(errorJson = errorBody, message = errorMessage, retryAfterSeconds = retryAfter, cause = cause)
+                    }
+                    in 400..499 -> throw LMStudioClientErrorException(httpStatusCode, errorJson = errorBody, message = errorMessage, cause = cause)
+                    in 500..599 -> throw LMStudioServerException(httpStatusCode, errorJson = errorBody, message = errorMessage, cause = cause)
+                    else -> throw LMStudioAPIException(httpStatusCode, errorJson = errorBody, message = "Unhandled API error (initial stream request): $errorMessage", cause = cause)
+                }
+            }
+            is Exception -> { // General catch-all
+                logger.error(cause) { "Unhandled exception during streaming: ${cause.message}" }
+                throw LMStudioConnectionException("Unhandled exception in stream: ${cause.message}", cause)
+            }
         }
     }
 
@@ -210,17 +350,44 @@ public open class LMStudioLLMClient(
             }
 
             if (response.status.isSuccess()) {
-                val openAIResponse = response.body<LMStudioEmbeddingResponse>()
-                if (openAIResponse.data.isNotEmpty()) {
-                    openAIResponse.data.first().embedding
-                } else {
-                    logger.error { "Empty data in LMStudio embedding response" }
-                    error("Empty data in LMStudio embedding response")
+                try {
+                    val openAIResponse = response.body<LMStudioEmbeddingResponse>()
+                    if (openAIResponse.data.isNotEmpty()) {
+                        openAIResponse.data.first().embedding
+                    } else {
+                        logger.error { "Empty data in LMStudio embedding response" }
+                        throw LMStudioMalformedResponseException("Empty data in LMStudio embedding response")
+                    }
+                } catch (e: SerializationException) {
+                    throw LMStudioMalformedResponseException("Failed to parse successful embedding response: ${e.message}", e)
                 }
             } else {
                 val errorBody = response.bodyAsText()
-                logger.error { "Error from LMStudio API: ${response.status}: $errorBody" }
-                error("Error from LMStudio API: ${response.status}: $errorBody")
+                val httpStatusCode = response.status.value
+                var errorDetails: LMStudioErrorDetails? = null
+                try {
+                    if (errorBody.isNotBlank()) {
+                        errorDetails = json.decodeFromString<LMStudioErrorDetails>(errorBody)
+                    }
+                } catch (e: SerializationException) {
+                    logger.warn { "Failed to parse LMStudio JSON error response for embeddings: $errorBody" }
+                }
+
+                val errorMessage = errorDetails?.getDetailedMessage() ?: errorBody
+                val logMessage = "Error from LMStudio Embeddings API: $httpStatusCode - $errorMessage. Details: $errorDetails"
+                logger.error { logMessage }
+
+                when (httpStatusCode) {
+                    401, 403 -> throw LMStudioAuthenticationException(errorJson = errorBody, message = errorMessage)
+                    404 -> throw LMStudioNotFoundException(errorJson = errorBody, message = errorMessage)
+                    429 -> {
+                        val retryAfter = response.headers[HttpHeaders.RetryAfter]?.toIntOrNull()
+                        throw LMStudioRateLimitException(errorJson = errorBody, message = errorMessage, retryAfterSeconds = retryAfter)
+                    }
+                    in 400..499 -> throw LMStudioClientErrorException(httpStatusCode, errorJson = errorBody, message = errorMessage)
+                    in 500..599 -> throw LMStudioServerException(httpStatusCode, errorJson = errorBody, message = errorMessage)
+                    else -> throw LMStudioAPIException(httpStatusCode, errorJson = errorBody, message = "Unhandled Embeddings API error: $errorMessage")
+                }
             }
         }
     }
@@ -394,12 +561,12 @@ public open class LMStudioLLMClient(
                     }
 
                     is MediaContent.File -> {
-                        require(model.capabilities.contains(LLMCapability.Vision.Image)) {
-                            "Model ${model.id} does not support files"
+                        require(model.capabilities.contains(LLMCapability.Vision.Document)) {
+                            "Model ${model.id} does not support document files"
                         }
 
-                        require(media.format == "pdf") {
-                            "File format ${media.format} not supported. Supported formats: `pdf`"
+                        require(media.format in listOf("pdf", "txt", "md")) {
+                            "File format ${media.format} not supported. Supported formats: `pdf`, `txt`, `md`"
                         }
                         val fileData = "data:${media.getMimeType()};base64,${media.toBase64()}"
                         add(
@@ -467,8 +634,8 @@ public open class LMStudioLLMClient(
     @OptIn(ExperimentalEncodingApi::class)
     private fun processLMStudioResponse(response: LMStudioResponse): List<Message.Response> {
         if (response.choices.isEmpty()) {
-            logger.error { "Empty choices in LMStudio response" }
-            error("Empty choices in LMStudio response")
+            // logger.error { "Empty choices in LMStudio response" } // This will be an exception from the caller
+            throw LMStudioMalformedResponseException("Empty choices in LMStudio response")
         }
 
         val (choice, message) = response.choices
@@ -512,11 +679,11 @@ public open class LMStudioLLMClient(
             }
 
             message.audio != null -> {
-                val audio = Base64.decode(message.audio.data)
+                val audioData = Base64.decode(message.audio.data)
                 listOf(
                     Message.Assistant(
                         content = message.audio.transcript ?: "",
-                        mediaContent = MediaContent.Audio(audio, format = ""),
+                        mediaContent = MediaContent.Audio(audioData, format = message.audio.format?.takeIf { it.isNotBlank() } ?: "wav"),
                         finishReason = choice.finishReason,
                         metaInfo = ResponseMetaInfo.create(
                             clock, totalTokensCount = totalTokensCount,

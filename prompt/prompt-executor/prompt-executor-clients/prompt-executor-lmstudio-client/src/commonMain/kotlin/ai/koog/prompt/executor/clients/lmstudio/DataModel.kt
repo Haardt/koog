@@ -227,6 +227,7 @@ internal enum class LMStudioAudioVoice {
 internal data class LMStudioAudio(
     val data: String,
     val transcript: String? = null,
+    val format: String? = null
 )
 
 internal object ContentSerializer : KSerializer<Content?> {
@@ -282,3 +283,44 @@ internal data class LMStudioModelsListResponse(
     @SerialName("object") val objectType: String,
     val data: List<LMStudioModelInfo>,
 )
+
+// Add at the end of the file
+
+/**
+ * Represents the different types of events that can be emitted by the LMStudio streaming client.
+ */
+public sealed interface LMStudioStreamEvent {
+    /**
+     * A chunk of text content from the language model.
+     * @property text The text content chunk.
+     */
+    public data class TextChunk(val text: String) : LMStudioStreamEvent
+
+    /**
+     * A chunk of a tool call's arguments from the language model.
+     * LMStudio may stream tool calls, with the function name and ID potentially arriving
+     * separately or together with the first chunk of arguments. Consumers might need to
+     * aggregate argument chunks based on `toolCallId` and `functionName`.
+     *
+     * @property toolCallId The unique identifier for the tool call.
+     * @property functionName The name of the function being called.
+     * @property argumentsChunk A chunk of the JSON string representing the function arguments.
+     * @property toolCallIndex The index of the tool call in the list of tool calls within a single delta, if multiple are present.
+     */
+    public data class ToolCallChunk(
+        val toolCallId: String,
+        val functionName: String,
+        val argumentsChunk: String,
+        val toolCallIndex: Int? = null // In case a single delta has multiple new tool_calls with argument chunks
+    ) : LMStudioStreamEvent
+
+    /**
+     * Indicates the reason why the stream finished.
+     * @property reason The finish reason (e.g., "stop", "length", "tool_calls").
+     */
+    public data class FinishReason(val reason: String) : LMStudioStreamEvent
+
+    // Consider adding an ErrorEvent if errors specific to stream content parsing
+    // are to be emitted as part of the flow rather than terminating it.
+    // For now, errors will terminate the flow as per previous error handling.
+}
